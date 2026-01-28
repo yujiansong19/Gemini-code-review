@@ -1,0 +1,5 @@
+{
+  "name": "Gemini CodeLens PRO",
+  "description": "专业级全栈代码审计工具，集成 Gemini 3 Pro 深度推理能力，专为 Java Spring 与 Vue 生态优化。",
+  "requestFramePermissions": []
+}
