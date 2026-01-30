@@ -6,14 +6,36 @@ export enum Severity {
   INFO = 'Info'
 }
 
+export enum AIProvider {
+  GEMINI = 'gemini',
+  OPENROUTER = 'openrouter',
+  QWEN = 'qwen',
+  GLM = 'glm'
+}
+
+export enum RemoteProvider {
+  GITHUB = 'github',
+  BITBUCKET = 'bitbucket'
+}
+
 export interface ProjectFile {
   name: string;
   content: string;
 }
 
+export interface RemoteConfig {
+  provider: RemoteProvider;
+  owner: string; // GitHub owner or Bitbucket workspace
+  repo: string;
+  branch: string;
+  token?: string; // GitHub Token
+  username?: string; // Bitbucket Username
+  password?: string; // Bitbucket App Password
+}
+
 export interface ReviewIssue {
   id: string;
-  filename: string; // 新增：标识问题所属文件
+  filename: string;
   line?: number;
   severity: Severity;
   category: string;
@@ -27,7 +49,8 @@ export interface CodeReviewResult {
   summary: string;
   score: number;
   issues: ReviewIssue[];
-  improvedCode?: string; // 对于工程评审，这可能是建议的架构重构描述或核心文件优化
+  improvedCode?: string;
+  timestamp?: string;
 }
 
 export interface ChatMessage {
@@ -36,9 +59,8 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
-export interface ReviewSession {
-  id: string;
-  timestamp: Date;
-  files: ProjectFile[];
-  result?: CodeReviewResult;
+export interface ModelConfig {
+  provider: AIProvider;
+  modelId: string;
+  baseUrl?: string;
 }

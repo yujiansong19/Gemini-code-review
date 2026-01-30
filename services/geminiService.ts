@@ -1,91 +1,106 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
-import { CodeReviewResult, Severity, ProjectFile } from "../types";
+import { CodeReviewResult, Severity, ProjectFile, AIProvider, ModelConfig } from "../types";
 
 export class GeminiService {
-  private getClient() {
-    return new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
+  // Always create a new instance before making an API call per guidelines
+  private createAIInstance() {
+    return new GoogleGenAI({ apiKey: process.env.API_KEY });
   }
 
-  async reviewProject(files: ProjectFile[]): Promise<CodeReviewResult> {
-    const ai = this.getClient();
+  private async callOpenAICompatible(config: ModelConfig, prompt: string, isJson: boolean = false): Promise<string> {
+    const defaultEndpoints: Record<string, string> = {
+      [AIProvider.OPENROUTER]: "https://openrouter.ai/api/v1/chat/completions",
+      [AIProvider.QWEN]: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      [AIProvider.GLM]: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    };
+
+    // Prioritize custom baseUrl if provided in config
+    const baseUrl = config.baseUrl || defaultEndpoints[config.provider];
+    if (!baseUrl) throw new Error(`未提供供应商 ${config.provider} 的 Base URL，且无默认配置。`);
+
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: config.modelId,
+        messages: [{ role: "user", content: prompt }],
+        response_format: isJson ? { type: "json_object" } : undefined,
+        temperature: 0.1
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: { message: `HTTP ${response.status}` } }));
+      throw new Error(err.error?.message || `API 请求失败: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+  }
+
+  async reviewProject(files: ProjectFile[], config: ModelConfig): Promise<CodeReviewResult> {
     const projectContext = files.map(f => `--- FILE: ${f.name} ---\n${f.content}`).join('\n\n');
     
-    const prompt = `你是一位世界级的全栈首席架构师，拥有超过15年的复杂系统设计经验。
-    请对以下代码工程进行深度评审。
+    const prompt = `你是一位世界级的全栈首席架构师，精通《阿里巴巴Java开发手册》与高性能 SQL 审计。
+    请深度评审以下工程代码。
     
-    项目背景与代码内容：
-    ${projectContext}
+    评审核心准则：
+    1. **阿里规约 (P3C)**：强制检查 POJO 命名、线程池规范、并发安全、Vue 命名与 Prop 校验。
+    2. **数据库优化**：检查 DDL 规范、严禁 SELECT *、检查 SQL 索引覆盖度。
+    3. **行级调整**：必须指出具体哪个文件、哪一行代码需要调整，并给出修正后的代码片段。
 
-    评审核心维度：
-    1. **Java & Spring 生态**：检查依赖注入、事务一致性、并发安全、JVM 优化及 Spring Boot 最佳实践。
-    2. **Vue.js & 前端工程化**：检查响应式开销、组件通信、内存泄露（事件监听未移除）、状态流管理。
-    3. **安全漏洞**：识别 SQL 注入、跨站脚本、越权风险及硬编码密钥。
-    4. **架构设计**：评估模块解耦、SOLID 原则及代码可维护性。
-    
-    输出要求：
-    - 使用结构化 JSON 响应。
-    - issues 中的 filename 必须精确匹配上传的文件名。
-    - 所有描述和建议请使用中文，专业术语可保留英文。`;
+    输出 JSON 格式，必须包含 issues 数组。
+    每个 issue 必须包含: id, filename, line (必须是数字), severity, category, title, description, suggestion, codeSnippet.
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingBudget: 32768 },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: { type: Type.STRING, description: "工程整体质量总结" },
-            score: { type: Type.NUMBER, description: "健康评分 0-100" },
-            issues: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  filename: { type: Type.STRING },
-                  line: { type: Type.NUMBER },
-                  severity: { type: Type.STRING, enum: Object.values(Severity) },
-                  category: { type: Type.STRING, description: "分类（如：性能, 安全, 规范）" },
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  suggestion: { type: Type.STRING },
-                  codeSnippet: { type: Type.STRING, description: "修复示例代码或问题片段" }
-                },
-                required: ["id", "filename", "severity", "category", "title", "description", "suggestion"]
+    代码内容：
+    ${projectContext}`;
+
+    if (config.provider === AIProvider.GEMINI) {
+      const ai = this.createAIInstance();
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-pro-preview',
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingBudget: 32768 },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: { type: Type.STRING },
+              score: { type: Type.NUMBER },
+              issues: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    filename: { type: Type.STRING },
+                    line: { type: Type.INTEGER },
+                    severity: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    title: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    suggestion: { type: Type.STRING },
+                    codeSnippet: { type: Type.STRING }
+                  },
+                  required: ["id", "filename", "line", "severity", "category", "title", "description", "suggestion"]
+                }
               }
             },
-            improvedCode: { type: Type.STRING, description: "对核心模块的总体优化方案描述" }
-          },
-          required: ["summary", "score", "issues"]
+            required: ["summary", "score", "issues"]
+          }
         }
-      }
-    });
-
-    try {
-      return JSON.parse(response.text || "{}") as CodeReviewResult;
-    } catch (e) {
-      console.error("Parse Error:", e);
-      throw new Error("AI 响应解析失败，请检查工程复杂度并重试。");
+      });
+      return JSON.parse(response.text || "{}");
+    } else {
+      const text = await this.callOpenAICompatible(config, prompt, true);
+      const jsonStr = text.replace(/```json/g, "").replace(/```/g, "").trim();
+      return JSON.parse(jsonStr);
     }
-  }
-
-  async chatAboutProject(history: { role: 'user' | 'assistant', content: string }[], message: string, files: ProjectFile[]): Promise<string> {
-    const ai = this.getClient();
-    const context = files.map(f => f.name).join(', ');
-    const chat = ai.chats.create({
-      model: 'gemini-3-flash-preview',
-      config: {
-        systemInstruction: `你是一位全栈专家助理，正在协助开发者评审名为 ${context} 的项目。
-        请基于文件内容提供精准的技术指导。风格专业、高效、见解深刻。使用中文。`
-      }
-    });
-
-    // 转换历史记录格式
-    const response = await chat.sendMessage({ message });
-    return response.text || "通信异常。";
   }
 }
 

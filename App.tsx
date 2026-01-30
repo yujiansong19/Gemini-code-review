@@ -10,10 +10,18 @@ import 'prismjs/components/prism-json';
 import 'prismjs/components/prism-markup';
 import 'prismjs/components/prism-css';
 import 'prismjs/components/prism-markdown';
+import 'prismjs/components/prism-sql';
 
 import { geminiService } from './services/geminiService';
-import { Severity, ReviewIssue, CodeReviewResult, ChatMessage, ProjectFile } from './types';
+import { Severity, ReviewIssue, CodeReviewResult, ChatMessage, ProjectFile, AIProvider, ModelConfig, RemoteConfig, RemoteProvider } from './types';
 import { Icon } from './components/Icon';
+
+const PRESET_MODELS: Record<string, ModelConfig> = {
+  "gemini-pro": { provider: AIProvider.GEMINI, modelId: "gemini-3-pro-preview" },
+  "openrouter": { provider: AIProvider.OPENROUTER, modelId: "anthropic/claude-3.5-sonnet" },
+  "qwen": { provider: AIProvider.QWEN, modelId: "qwen-max" },
+  "glm": { provider: AIProvider.GLM, modelId: "glm-4" }
+};
 
 const HighlightingCodeBlock: React.FC<{ code: string; language: string; className?: string }> = ({ code, language, className = "" }) => {
   const langKey = language === 'vue' || language === 'html' ? 'markup' : language;
@@ -28,46 +36,147 @@ const HighlightingCodeBlock: React.FC<{ code: string; language: string; classNam
 };
 
 const App: React.FC = () => {
-  const [mode, setMode] = useState<'single' | 'project'>('project');
-  const [singleCode, setSingleCode] = useState<string>('');
+  const [mode, setMode] = useState<'single' | 'project' | 'remote'>('project');
+  const [currentModelKey, setCurrentModelKey] = useState<string>("gemini-pro");
+  const [customBaseUrl, setCustomBaseUrl] = useState<string>("");
+  
+  // Local Project States
   const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
-  const [language, setLanguage] = useState<string>('java');
+  const [pastedCode, setPastedCode] = useState<string>("");
+  const [pastedFileName, setPastedFileName] = useState<string>("App.java");
+
+  // Remote Config States
+  const [remoteConfig, setRemoteConfig] = useState<RemoteConfig>({ 
+    provider: RemoteProvider.GITHUB, 
+    owner: '', 
+    repo: '', 
+    branch: 'main' 
+  });
+  
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [remoteFiles, setRemoteFiles] = useState<ProjectFile[]>([]);
+  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
+
   const [isReviewing, setIsReviewing] = useState<boolean>(false);
   const [reviewResult, setReviewResult] = useState<CodeReviewResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedIssue, setSelectedIssue] = useState<ReviewIssue | null>(null);
   
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState<string>('');
-  const [isChatting, setIsChatting] = useState<boolean>(false);
-  const [showChat, setShowChat] = useState<boolean>(false);
-
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const hasConfigKey = !!process.env.API_KEY && process.env.API_KEY !== 'undefined';
   const folderInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    if (showChat) chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, showChat]);
+  const selectedModelConfig = PRESET_MODELS[currentModelKey];
+  const isCustomizableProvider = selectedModelConfig.provider !== AIProvider.GEMINI;
 
-  const processFiles = (files: FileList | null) => {
+  const fetchBitbucketFiles = async (workspace: string, repo: string, branch: string, authHeader: string) => {
+    const relevantExtensions = ['.java', '.vue', '.sql', '.ts', '.js', '.tsx', '.jsx'];
+    const loaded: ProjectFile[] = [];
+
+    const fetchLevel = async (path: string = "") => {
+      const url = `https://api.bitbucket.org/2.0/repositories/${workspace}/${repo}/src/${branch}/${path}`;
+      const res = await fetch(url, { headers: { 'Authorization': authHeader } });
+      if (!res.ok) throw new Error(`Bitbucket 访问失败: ${res.status}`);
+      
+      const data = await res.json();
+      for (const entry of data.values) {
+        if (entry.type === 'commit_directory') {
+          await fetchLevel(entry.path);
+        } else if (entry.type === 'commit_file') {
+          if (relevantExtensions.some(ext => entry.path.endsWith(ext)) && loaded.length < 30) {
+            const contentRes = await fetch(entry.links.self.href, { headers: { 'Authorization': authHeader } });
+            const content = await contentRes.text();
+            loaded.push({ name: entry.path, content });
+          }
+        }
+      }
+    };
+
+    await fetchLevel();
+    return loaded;
+  };
+
+  const fetchRemoteFiles = async () => {
+    if (!remoteConfig.owner || !remoteConfig.repo) {
+      setError("请完整输入工程路径（所有者/项目名）。");
+      return;
+    }
+
+    setIsSyncing(true);
+    setError(null);
+    try {
+      if (remoteConfig.provider === RemoteProvider.GITHUB) {
+        const headers: HeadersInit = remoteConfig.token ? { 'Authorization': `token ${remoteConfig.token}` } : {};
+        const url = `https://api.github.com/repos/${remoteConfig.owner}/${remoteConfig.repo}/git/trees/${remoteConfig.branch}?recursive=1`;
+        
+        const treeRes = await fetch(url, { headers });
+        if (!treeRes.ok) throw new Error("无法连接 GitHub。请检查路径或访问令牌。");
+        
+        const treeData = await treeRes.json();
+        const relevantExtensions = ['.java', '.vue', '.sql', '.ts', '.js', '.tsx', '.jsx'];
+        
+        const blobs = treeData.tree.filter((node: any) => 
+          node.type === 'blob' && 
+          relevantExtensions.some(ext => node.path.endsWith(ext)) &&
+          !node.path.includes('node_modules/')
+        ).slice(0, 30);
+
+        const loaded: ProjectFile[] = [];
+        for (const node of blobs) {
+          const fileRes = await fetch(node.url, { headers });
+          const fileData = await fileRes.json();
+          const content = atob(fileData.content.replace(/\n/g, ''));
+          loaded.push({ name: node.path, content });
+        }
+        setRemoteFiles(loaded);
+      } else {
+        if (!remoteConfig.username || !remoteConfig.password) {
+          throw new Error("Bitbucket 私有库审计需要用户名和应用密码。");
+        }
+        const auth = btoa(`${remoteConfig.username}:${remoteConfig.password}`);
+        const loaded = await fetchBitbucketFiles(remoteConfig.owner, remoteConfig.repo, remoteConfig.branch, `Basic ${auth}`);
+        setRemoteFiles(loaded);
+      }
+
+      setLastSyncTime(new Date().toLocaleTimeString());
+      setMode('remote');
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const processLocalFolder = (files: FileList | null) => {
     if (!files) return;
+    setProjectFiles([]);
     Array.from(files).forEach(file => {
       const path = (file as any).webkitRelativePath || file.name;
-      const ignore = ['node_modules', '.git', 'dist', 'target', '.idea', '.vscode', 'build'];
-      if (ignore.some(p => path.includes(p)) || file.size > 500000) return;
-
+      if (file.size > 1024 * 500) return;
       const reader = new FileReader();
       reader.onload = (e) => {
         const content = e.target?.result as string;
-        setProjectFiles(prev => [...prev.filter(f => f.name !== path), { name: path, content }]);
+        setProjectFiles(prev => [...prev, { name: path, content }]);
       };
       reader.readAsText(file);
     });
+    setMode('project');
   };
 
   const handleReview = async () => {
-    const files = mode === 'single' ? [{ name: 'snippet.' + language, content: singleCode }] : projectFiles;
-    if (files.length === 0) return;
+    if (!hasConfigKey) {
+      setError("未检测到 API 密钥。请确保启动脚本已正确配置环境变量。");
+      return;
+    }
+    
+    let files: ProjectFile[] = [];
+    if (mode === 'project') files = projectFiles;
+    else if (mode === 'remote') files = remoteFiles;
+    else if (mode === 'single') files = [{ name: pastedFileName, content: pastedCode }];
+
+    if (files.length === 0 || (mode === 'single' && !pastedCode.trim())) {
+      setError("无可审计的代码。请同步远程仓库、上传本地文件夹或粘贴代码片段。");
+      return;
+    }
 
     setIsReviewing(true);
     setError(null);
@@ -75,8 +184,12 @@ const App: React.FC = () => {
     setSelectedIssue(null);
     
     try {
-      const result = await geminiService.reviewProject(files);
-      setReviewResult(result);
+      const configWithBaseUrl = {
+        ...selectedModelConfig,
+        baseUrl: customBaseUrl.trim() || undefined
+      };
+      const result = await geminiService.reviewProject(files, configWithBaseUrl);
+      setReviewResult({ ...result, timestamp: new Date().toLocaleTimeString() });
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -84,212 +197,300 @@ const App: React.FC = () => {
     }
   };
 
-  const handleChat = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!chatInput.trim() || isChatting) return;
-
-    const userMsg: ChatMessage = { role: 'user', content: chatInput, timestamp: new Date() };
-    setChatMessages(prev => [...prev, userMsg]);
-    setChatInput('');
-    setIsChatting(true);
-
-    try {
-      const res = await geminiService.chatAboutProject(chatMessages, chatInput, projectFiles);
-      setChatMessages(prev => [...prev, { role: 'assistant', content: res, timestamp: new Date() }]);
-    } catch {
-      setError("AI 专家暂时离开。");
-    } finally {
-      setIsChatting(false);
-    }
-  };
-
-  const getSeverityStyles = (sev: Severity) => {
-    switch (sev) {
-      case Severity.CRITICAL: return 'bg-red-500/10 text-red-400 border-red-500/20';
-      case Severity.WARNING: return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
-      case Severity.SUGGESTION: return 'bg-blue-500/10 text-blue-400 border-blue-500/20';
-      default: return 'bg-slate-500/10 text-slate-400 border-slate-500/20';
-    }
+  const getLanguage = (filename: string) => {
+    const ext = filename.split('.').pop()?.toLowerCase();
+    if (ext === 'java') return 'java';
+    if (ext === 'sql') return 'sql';
+    if (ext === 'vue' || ext === 'html') return 'markup';
+    return 'typescript';
   };
 
   return (
-    <div className="h-screen flex flex-col bg-[#0b0f1a] text-slate-300 font-inter selection:bg-emerald-500/30">
-      {/* Top Navbar */}
-      <nav className="h-14 border-b border-slate-800/60 bg-[#0f172a]/80 backdrop-blur-xl flex items-center justify-between px-6 z-50">
-        <div className="flex items-center gap-4">
-          <div className="p-2 bg-gradient-to-br from-emerald-400 to-teal-600 rounded-lg shadow-lg shadow-emerald-500/20">
-            <Icon name="code" className="text-white" size={18} />
+    <div className="h-screen flex flex-col bg-[#0b0f1a] text-slate-300 font-inter selection:bg-emerald-500/30 overflow-hidden">
+      {/* Navbar */}
+      <nav className="h-16 border-b border-slate-800/60 bg-[#0f172a]/80 backdrop-blur-xl flex items-center justify-between px-6 z-50">
+        <div className="flex items-center gap-5">
+          <div className="p-2.5 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl shadow-lg">
+            <Icon name="shield" className="text-white" size={20} />
           </div>
-          <span className="text-lg font-bold tracking-tight text-white">Gemini <span className="text-emerald-400">CodeLens</span></span>
-          <div className="h-4 w-px bg-slate-800 mx-2"></div>
-          <div className="flex bg-slate-900/50 p-1 rounded-lg border border-slate-800">
-            <button onClick={() => setMode('project')} className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${mode === 'project' ? 'bg-slate-800 text-emerald-400' : 'text-slate-500 hover:text-slate-300'}`}>工程</button>
-            <button onClick={() => setMode('single')} className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${mode === 'single' ? 'bg-slate-800 text-emerald-400' : 'text-slate-500 hover:text-slate-300'}`}>快查</button>
+          <div className="flex flex-col">
+            <span className="text-sm font-black tracking-tight text-white uppercase italic">Gemini CodeLens <span className="text-indigo-400">PRO</span></span>
+            <span className="text-[9px] font-bold text-slate-500 tracking-[0.2em]">MULTI-CLOUD AUDITOR</span>
+          </div>
+          
+          <div className="h-6 w-px bg-slate-800 mx-1"></div>
+          
+          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-[10px] font-bold shadow-sm transition-all ${hasConfigKey ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-400' : 'border-red-500/30 bg-red-500/5 text-red-400'}`}>
+            <div className={`w-1.5 h-1.5 rounded-full ${hasConfigKey ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+            {hasConfigKey ? "核心引擎就绪" : "等待密钥配置"}
           </div>
         </div>
 
         <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <select 
+              value={currentModelKey}
+              onChange={(e) => setCurrentModelKey(e.target.value)}
+              className="bg-slate-900 border border-slate-800 text-[11px] font-bold px-3 py-1.5 rounded-lg outline-none text-slate-400 focus:border-indigo-500/50"
+            >
+              <option value="gemini-pro">Gemini 3 Pro (阿里规约深度审计)</option>
+              <option value="openrouter">Claude 3.5 (OpenRouter)</option>
+              <option value="qwen">通义千问 (Qwen)</option>
+              <option value="glm">智谱 AI (GLM)</option>
+            </select>
+
+            {isCustomizableProvider && (
+              <div className="flex items-center gap-2 group">
+                <Icon name="settings" size={14} className="text-slate-500" />
+                <input 
+                  type="text"
+                  placeholder="Base URL"
+                  value={customBaseUrl}
+                  onChange={(e) => setCustomBaseUrl(e.target.value)}
+                  className="bg-slate-900 border border-slate-800 text-[10px] px-3 py-1.5 rounded-lg outline-none text-slate-300 w-40 focus:border-indigo-500/50"
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="flex bg-slate-900/80 p-1.5 rounded-xl border border-slate-800">
+            <button onClick={() => setMode('project')} className={`px-4 py-1 text-[11px] font-bold rounded-lg transition-all ${mode === 'project' || mode === 'single' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>本地模式</button>
+            <button onClick={() => setMode('remote')} className={`px-4 py-1 text-[11px] font-bold rounded-lg transition-all ${mode === 'remote' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>远程同步</button>
+          </div>
+          
           <button 
             onClick={handleReview}
             disabled={isReviewing}
-            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow-lg shadow-emerald-900/20"
+            className="px-6 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-black uppercase tracking-widest flex items-center gap-2 transition-all shadow-xl shadow-emerald-600/20"
           >
-            {isReviewing ? <Icon name="refresh" className="animate-spin" size={16}/> : <Icon name="zap" size={16}/>}
-            {isReviewing ? "分析中..." : "启动评审"}
+            {isReviewing ? <Icon name="refresh" className="animate-spin" size={14}/> : <Icon name="zap" size={14}/>}
+            {isReviewing ? "正在推理审计..." : "启动 AI 审计"}
           </button>
         </div>
       </nav>
 
       <main className="flex-1 flex overflow-hidden">
-        {/* Left: Project Explorer or Editor */}
-        <aside className="w-1/4 border-r border-slate-800/60 bg-[#0f172a]/30 flex flex-col">
-          {mode === 'project' ? (
-            <div className="flex flex-col h-full">
-              <div className="p-4 flex items-center justify-between border-b border-slate-800/40">
-                <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">资源管理器</span>
-                <button onClick={() => folderInputRef.current?.click()} className="p-1 hover:bg-slate-800 rounded transition-colors text-emerald-500">
-                  <Icon name="copy" size={14}/>
-                </button>
-                <input type="file" ref={folderInputRef} // @ts-ignore
-                webkitdirectory="true" directory="" className="hidden" onChange={(e) => processFiles(e.target.files)} />
+        {/* Left Side: Controls */}
+        <aside className="w-80 border-r border-slate-800/60 bg-[#0f172a]/40 flex flex-col p-5 space-y-6 overflow-y-auto custom-scrollbar">
+          {mode === 'remote' ? (
+            <div className="flex flex-col space-y-5">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] font-black uppercase text-indigo-400 tracking-wider">远程同步审计</span>
+                <p className="text-[9px] text-slate-500">同步 Bitbucket 或 GitHub 进行工程化审计</p>
               </div>
-              <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                {projectFiles.length === 0 ? (
-                  <div className="h-40 flex flex-col items-center justify-center text-center p-6 opacity-30">
-                    <Icon name="eye" size={24} className="mb-2"/>
-                    <p className="text-[10px]">点击上方图标上传 Java/Vue 工程文件夹</p>
+
+              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800">
+                <button 
+                  onClick={() => setRemoteConfig(prev => ({ ...prev, provider: RemoteProvider.GITHUB, branch: 'main' }))}
+                  className={`flex-1 py-1.5 text-[10px] font-black uppercase rounded-lg transition-all ${remoteConfig.provider === RemoteProvider.GITHUB ? 'bg-slate-800 text-white' : 'text-slate-600'}`}
+                >GitHub</button>
+                <button 
+                  onClick={() => setRemoteConfig(prev => ({ ...prev, provider: RemoteProvider.BITBUCKET, branch: 'master' }))}
+                  className={`flex-1 py-1.5 text-[10px] font-black uppercase rounded-lg transition-all ${remoteConfig.provider === RemoteProvider.BITBUCKET ? 'bg-slate-800 text-white' : 'text-slate-600'}`}
+                >Bitbucket</button>
+              </div>
+              
+              <div className="space-y-4 bg-slate-900/50 p-4 rounded-2xl border border-slate-800">
+                <div className="space-y-1.5">
+                  <label className="text-[9px] text-slate-400 uppercase font-black">仓库路径 (Workspace/Repo)</label>
+                  <input 
+                    value={`${remoteConfig.owner}${remoteConfig.owner && remoteConfig.repo ? '/' : ''}${remoteConfig.repo}`}
+                    onChange={(e) => {
+                      const [o, r] = e.target.value.split('/');
+                      setRemoteConfig(prev => ({ ...prev, owner: o || '', repo: r || '' }));
+                    }}
+                    placeholder="owner/repo"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-indigo-300 outline-none"
+                  />
+                </div>
+                {remoteConfig.provider === RemoteProvider.BITBUCKET && (
+                  <div className="space-y-3">
+                    <input value={remoteConfig.username || ""} onChange={e => setRemoteConfig(prev => ({ ...prev, username: e.target.value }))} placeholder="Bitbucket 用户名" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs outline-none" />
+                    <input type="password" value={remoteConfig.password || ""} onChange={e => setRemoteConfig(prev => ({ ...prev, password: e.target.value }))} placeholder="App Password" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs outline-none" />
                   </div>
-                ) : projectFiles.map(f => (
-                  <div key={f.name} className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-800/50 rounded group cursor-default">
-                    <span className={`w-1 h-1 rounded-full ${f.name.endsWith('.java') ? 'bg-red-400' : f.name.endsWith('.vue') ? 'bg-emerald-400' : 'bg-blue-400'}`}></span>
-                    <span className="truncate flex-1">{f.name}</span>
+                )}
+                {remoteConfig.provider === RemoteProvider.GITHUB && (
+                  <input type="password" value={remoteConfig.token || ""} onChange={e => setRemoteConfig(prev => ({ ...prev, token: e.target.value }))} placeholder="GitHub Token (可选)" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs outline-none" />
+                )}
+                <button onClick={fetchRemoteFiles} disabled={isSyncing} className="w-full py-2 bg-indigo-600 text-white rounded-xl text-[10px] font-black uppercase shadow-lg hover:bg-indigo-500 transition-colors">
+                  {isSyncing ? "正在拉取..." : "拉取远程代码"}
+                </button>
+              </div>
+              <div className="flex-1 space-y-1">
+                <span className="text-[9px] font-black uppercase text-slate-600 px-2">拉取文件 ({remoteFiles.length})</span>
+                {remoteFiles.map((f, idx) => (
+                  <div key={idx} className="flex items-center gap-2 px-3 py-1.5 hover:bg-slate-800/40 rounded-lg group">
+                    <Icon name="copy" size={10} className="text-slate-600 group-hover:text-indigo-400"/>
+                    <span className="text-[10px] font-mono truncate text-slate-400 group-hover:text-slate-200">{f.name}</span>
                   </div>
                 ))}
               </div>
             </div>
           ) : (
-            <div className="flex flex-col h-full p-4 gap-4">
-              <span className="text-[10px] font-black uppercase tracking-widest text-slate-500">代码片段</span>
-              <select value={language} onChange={e => setLanguage(e.target.value)} className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-xs outline-none">
-                <option value="java">Java</option>
-                <option value="vue">Vue</option>
-                <option value="typescript">TypeScript</option>
-              </select>
-              <div className="flex-1 border border-slate-800 rounded-lg overflow-hidden bg-slate-950/50">
-                <Editor
-                  value={singleCode}
-                  onValueChange={c => setSingleCode(c)}
-                  highlight={c => Prism.highlight(c, Prism.languages[language] || Prism.languages.javascript, language)}
-                  padding={12}
-                  className="font-fira text-xs"
-                  placeholder="在此粘贴代码进行即时诊断..."
-                />
+            <div className="flex flex-col h-full space-y-5">
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] font-black uppercase text-indigo-400 tracking-wider">本地代码扫描</span>
+                <p className="text-[9px] text-slate-500">上传项目目录或直接粘贴代码片段</p>
               </div>
+
+              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800">
+                <button onClick={() => setMode('project')} className={`flex-1 py-1.5 text-[10px] font-black uppercase rounded-lg transition-all ${mode === 'project' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-600'}`}>文件夹模式</button>
+                <button onClick={() => setMode('single')} className={`flex-1 py-1.5 text-[10px] font-black uppercase rounded-lg transition-all ${mode === 'single' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-600'}`}>代码粘贴</button>
+              </div>
+
+              {mode === 'project' ? (
+                <div className="flex flex-col flex-1 space-y-4">
+                  <button onClick={() => folderInputRef.current?.click()} className="w-full py-6 border-2 border-dashed border-slate-800 rounded-2xl flex flex-col items-center justify-center gap-2 hover:border-indigo-500/50 hover:bg-indigo-500/5 transition-all text-slate-500 group">
+                    <Icon name="copy" size={28} className="group-hover:text-indigo-400 transition-transform group-hover:scale-110"/>
+                    <span className="text-[10px] font-bold uppercase tracking-widest">选择本地工程文件夹</span>
+                  </button>
+                  <input type="file" ref={folderInputRef} // @ts-ignore
+                  webkitdirectory="true" directory="" className="hidden" onChange={(e) => processLocalFolder(e.target.files)} />
+                  <div className="flex-1 overflow-y-auto space-y-1">
+                    <span className="text-[9px] font-black uppercase text-slate-600 px-2 mb-2 block">已载入文件 ({projectFiles.length})</span>
+                    {projectFiles.map((f, idx) => (
+                      <div key={idx} className="flex items-center gap-2 px-3 py-1.5 text-[10px] text-slate-400 hover:bg-slate-800/30 rounded-lg">
+                        <div className="w-1 h-1 bg-slate-700 rounded-full"></div>
+                        <span className="truncate font-mono">{f.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col flex-1 space-y-4 overflow-hidden">
+                  <div className="space-y-1.5">
+                    <label className="text-[9px] text-slate-500 uppercase font-black tracking-widest">虚拟文件名 / 语言识别</label>
+                    <input value={pastedFileName} onChange={e => setPastedFileName(e.target.value)} placeholder="App.java" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-indigo-300 outline-none" />
+                  </div>
+                  <div className="flex-1 flex flex-col border border-slate-800 rounded-2xl overflow-hidden bg-slate-950 shadow-inner">
+                     <Editor
+                        value={pastedCode}
+                        onValueChange={code => setPastedCode(code)}
+                        highlight={code => Prism.highlight(code, Prism.languages[getLanguage(pastedFileName)], getLanguage(pastedFileName))}
+                        padding={15}
+                        className="font-mono text-[11px] flex-1 overflow-auto"
+                        style={{ outline: 'none' }}
+                        textareaClassName="outline-none focus:ring-0"
+                      />
+                  </div>
+                  <p className="text-[9px] text-slate-600 italic">编辑器支持 Java, SQL, Vue, TS, JS 等多种高亮</p>
+                </div>
+              )}
             </div>
           )}
         </aside>
 
-        {/* Center: Report & Details */}
-        <section className="flex-1 flex flex-col bg-[#0b0f1a] overflow-hidden">
-          {!reviewResult && !isReviewing ? (
-            <div className="flex-1 flex flex-col items-center justify-center p-12 text-center">
-              <div className="w-24 h-24 bg-slate-900/50 rounded-3xl flex items-center justify-center mb-8 border border-slate-800 border-dashed animate-pulse">
-                <Icon name="shield" size={40} className="text-slate-700"/>
+        {/* Center Report Area */}
+        <section className="flex-1 flex flex-col bg-[#0b0f1a] overflow-hidden relative">
+          {isReviewing ? (
+            <div className="flex-1 flex flex-col items-center justify-center space-y-8 animate-in fade-in duration-500">
+              <div className="relative">
+                <div className="w-24 h-24 border-4 border-indigo-500/10 border-t-indigo-500 rounded-full animate-spin"></div>
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Icon name="zap" size={32} className="text-indigo-400 animate-pulse"/>
+                </div>
               </div>
-              <h2 className="text-xl font-bold text-white mb-3">准备就绪，等待扫描</h2>
-              <p className="text-slate-500 max-w-sm text-sm">上传工程或粘贴代码，AI 专家将立即开始深度性能分析与安全审计。</p>
+              <div className="text-center space-y-2">
+                <p className="text-indigo-400 font-black text-xl tracking-tighter uppercase italic">Gemini Reasoning...</p>
+                <p className="text-slate-600 text-[10px] font-mono tracking-widest">Applying Alibaba P3C Standards & Logic Analysis</p>
+              </div>
             </div>
-          ) : isReviewing ? (
-            <div className="flex-1 flex flex-col items-center justify-center space-y-6">
-              <div className="w-16 h-16 border-4 border-emerald-500/20 border-t-emerald-500 rounded-full animate-spin"></div>
-              <div className="text-center">
-                <p className="text-emerald-400 font-bold animate-pulse text-lg">专家正在深度审查逻辑中...</p>
-                <p className="text-slate-600 text-xs mt-2 italic">正在应用 Spring 事务模型与 Vue 响应式原理进行比对</p>
-              </div>
+          ) : !reviewResult ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-20 text-center opacity-30 select-none">
+              <Icon name="shield" size={100} className="mb-8 text-slate-800"/>
+              <h2 className="text-3xl font-black text-white mb-4 tracking-tighter uppercase italic">等待审计引擎启动</h2>
+              <p className="text-sm max-w-sm text-slate-500 leading-relaxed font-medium">
+                通过左侧面板载入代码。无论是整个工程文件夹，<br/>
+                还是粘贴的临时代码片段，我们都能进行深度诊断。
+              </p>
             </div>
           ) : (
-            <div className="flex-1 flex flex-col overflow-hidden">
-              {/* Summary Header */}
-              <div className="p-8 border-b border-slate-800/40 bg-gradient-to-r from-slate-900/20 to-transparent">
-                <div className="flex justify-between items-start">
-                  <div className="max-w-2xl">
-                    <h2 className="text-2xl font-black text-white mb-3 flex items-center gap-3">
-                      工程审计报告
-                      <span className="text-[10px] px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full">v3.0 PRO</span>
-                    </h2>
-                    <p className="text-slate-400 text-sm leading-relaxed border-l-2 border-emerald-500/50 pl-4">{reviewResult.summary}</p>
+            <div className="flex-1 flex flex-col overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="p-10 border-b border-slate-800/40 bg-[#0f172a]/20 backdrop-blur-sm flex justify-between items-start">
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-4xl font-black text-white tracking-tighter uppercase italic">工程代码审计报告</h2>
+                    <span className="bg-indigo-500/10 text-indigo-400 text-[10px] font-black px-3 py-1 rounded-full border border-indigo-500/20">PRO EDITION</span>
                   </div>
-                  <div className="flex flex-col items-center p-4 bg-slate-900/80 rounded-2xl border border-slate-800 shadow-xl">
-                    <span className={`text-4xl font-black ${reviewResult.score >= 80 ? 'text-emerald-400' : reviewResult.score >= 60 ? 'text-amber-400' : 'text-red-400'}`}>
-                      {reviewResult.score}
-                    </span>
-                    <span className="text-[9px] font-bold text-slate-500 uppercase tracking-tighter mt-1">综合质量评分</span>
-                  </div>
+                  <p className="text-slate-400 text-sm max-w-4xl leading-relaxed font-medium">{reviewResult.summary}</p>
+                </div>
+                <div className="p-8 bg-slate-900/80 rounded-[32px] border border-slate-800 flex flex-col items-center min-w-[160px] shadow-2xl backdrop-blur-md">
+                  <span className={`text-6xl font-black ${reviewResult.score >= 80 ? 'text-emerald-400' : reviewResult.score >= 60 ? 'text-amber-400' : 'text-red-400'}`}>
+                    {reviewResult.score}
+                  </span>
+                  <span className="text-[10px] font-black text-slate-500 uppercase mt-3 tracking-widest">合规度评分</span>
                 </div>
               </div>
 
-              {/* Main Content Areas */}
-              <div className="flex-1 flex overflow-hidden p-6 gap-6">
-                {/* Issues List */}
-                <div className="w-1/2 flex flex-col gap-3 overflow-y-auto pr-2">
-                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-1">检测到 {reviewResult.issues.length} 处异常</span>
+              <div className="flex-1 flex overflow-hidden p-8 gap-8">
+                {/* Issues Sidebar */}
+                <div className="w-5/12 overflow-y-auto space-y-4 pr-4 custom-scrollbar">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[10px] font-black uppercase text-slate-600 tracking-widest">诊断列表 ({reviewResult.issues.length})</span>
+                  </div>
                   {reviewResult.issues.map(issue => (
                     <button 
                       key={issue.id}
                       onClick={() => setSelectedIssue(issue)}
-                      className={`text-left p-4 rounded-xl border transition-all ${selectedIssue?.id === issue.id ? 'bg-slate-800/80 border-emerald-500/50 ring-1 ring-emerald-500/20' : 'bg-slate-900/40 border-slate-800 hover:border-slate-700'}`}
+                      className={`w-full text-left p-5 rounded-2xl border transition-all duration-300 relative group overflow-hidden ${selectedIssue?.id === issue.id ? 'bg-slate-800/80 border-indigo-500/50 shadow-2xl scale-[1.02]' : 'bg-slate-900/30 border-slate-800 hover:border-slate-700 hover:bg-slate-800/20'}`}
                     >
-                      <div className="flex items-center justify-between mb-2">
-                        <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase ${getSeverityStyles(issue.severity as Severity)}`}>
+                      <div className="flex items-center gap-3 mb-3">
+                         <span className={`text-[9px] font-black uppercase px-2.5 py-1 rounded-lg ${issue.severity === Severity.CRITICAL ? 'bg-red-500/10 text-red-400 border border-red-500/20' : issue.severity === Severity.WARNING ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' : 'bg-blue-500/10 text-blue-400 border border-blue-500/20'}`}>
                           {issue.severity}
-                        </span>
-                        <span className="text-[10px] text-slate-500 font-mono truncate ml-4 opacity-60">
-                          {issue.filename.split('/').pop()}
-                        </span>
+                         </span>
+                         <span className="text-[10px] font-mono text-slate-500 truncate group-hover:text-slate-400">{issue.filename}{issue.line ? `:${issue.line}` : ''}</span>
                       </div>
-                      <h4 className="text-sm font-bold text-slate-200 truncate">{issue.title}</h4>
-                      <p className="text-[11px] text-slate-500 mt-1 line-clamp-2">{issue.description}</p>
+                      <h4 className="text-[14px] font-black text-slate-200 leading-tight group-hover:text-white transition-colors">{issue.title}</h4>
+                      {selectedIssue?.id === issue.id && <div className="absolute left-0 top-0 bottom-0 w-1 bg-indigo-500"></div>}
                     </button>
                   ))}
                 </div>
 
-                {/* Selected Issue Detail */}
-                <div className="w-1/2 bg-slate-900/30 rounded-2xl border border-slate-800/60 overflow-hidden flex flex-col">
+                {/* Details Viewer */}
+                <div className="w-7/12 bg-slate-900/20 rounded-[40px] border border-slate-800/50 overflow-hidden flex flex-col shadow-inner relative group/detail">
                   {selectedIssue ? (
-                    <div className="flex flex-col h-full animate-in fade-in duration-300">
-                      <div className="p-6 border-b border-slate-800/40">
-                        <div className="flex items-center gap-2 text-indigo-400 text-[10px] font-black uppercase mb-3">
-                          <Icon name="alert" size={14}/>
-                          {selectedIssue.category}
-                        </div>
-                        <h3 className="text-lg font-bold text-white mb-2">{selectedIssue.title}</h3>
-                        <p className="text-sm text-slate-400 leading-relaxed">{selectedIssue.description}</p>
+                    <div className="flex flex-col h-full overflow-hidden animate-in fade-in slide-in-from-right-4 duration-300">
+                      <div className="p-10 border-b border-slate-800/40 bg-slate-900/40">
+                         <div className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                           <Icon name="eye" size={14}/> 诊断详情
+                         </div>
+                         <h3 className="text-2xl font-black text-white mb-4 leading-tight">{selectedIssue.title}</h3>
+                         <p className="text-sm text-slate-400 leading-relaxed font-medium">{selectedIssue.description}</p>
                       </div>
-                      <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                        <div className="p-4 bg-emerald-500/5 border border-emerald-500/20 rounded-xl">
-                          <h4 className="text-xs font-bold text-emerald-400 mb-2 flex items-center gap-2">
-                            <Icon name="check" size={14}/> 建议解决方案
-                          </h4>
-                          <p className="text-xs text-slate-300 leading-relaxed">{selectedIssue.suggestion}</p>
+                      <div className="flex-1 overflow-y-auto p-10 space-y-10 custom-scrollbar">
+                        <div className="space-y-4">
+                           <h4 className="text-[11px] font-black text-emerald-400 uppercase tracking-widest flex items-center gap-2">
+                             <Icon name="check" size={16}/> 修正建议与规约对标
+                           </h4>
+                           <div className="p-6 bg-emerald-500/5 border border-emerald-500/20 rounded-3xl text-[14px] text-slate-300 leading-relaxed shadow-sm">
+                             {selectedIssue.suggestion}
+                           </div>
                         </div>
                         {selectedIssue.codeSnippet && (
-                          <div className="rounded-xl overflow-hidden border border-slate-800">
-                            <div className="bg-slate-800/50 px-4 py-1.5 flex justify-between items-center">
-                              <span className="text-[10px] text-slate-500 font-mono">FIX_EXAMPLE</span>
-                            </div>
-                            <HighlightingCodeBlock 
-                              code={selectedIssue.codeSnippet} 
-                              language={selectedIssue.filename.split('.').pop() || 'typescript'} 
-                              className="!bg-[#050505] !p-5 !text-[11px]"
-                            />
+                          <div className="space-y-4">
+                             <div className="flex items-center justify-between">
+                               <h4 className="text-[11px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-2">
+                                 <Icon name="code" size={16}/> 源码引用
+                               </h4>
+                               <span className="text-[9px] font-mono text-slate-600">{selectedIssue.filename}</span>
+                             </div>
+                             <div className="rounded-3xl overflow-hidden border border-slate-800/80 shadow-2xl group-hover/detail:border-indigo-500/20 transition-colors">
+                               <HighlightingCodeBlock 
+                                code={selectedIssue.codeSnippet} 
+                                language={getLanguage(selectedIssue.filename)} 
+                                className="!p-8 !bg-[#050505] !m-0 !text-[13px] !leading-relaxed" 
+                               />
+                             </div>
                           </div>
                         )}
                       </div>
                     </div>
                   ) : (
-                    <div className="flex-1 flex flex-col items-center justify-center text-slate-600 opacity-40">
-                      <Icon name="eye" size={32} className="mb-4"/>
-                      <p className="text-xs">选择左侧问题查看详细诊断与修复建议</p>
+                    <div className="flex-1 flex flex-col items-center justify-center text-slate-700 space-y-4">
+                      <div className="p-6 rounded-full bg-slate-800/10">
+                        <Icon name="eye" size={48} className="opacity-20"/>
+                      </div>
+                      <p className="text-[11px] font-black uppercase tracking-[0.3em]">选择一项诊断以展开精细化建议</p>
                     </div>
                   )}
                 </div>
@@ -299,61 +500,18 @@ const App: React.FC = () => {
         </section>
       </main>
 
-      {/* Floating Chat Assistant */}
-      <div className={`fixed bottom-6 right-6 w-96 flex flex-col transition-all duration-300 z-[100] ${showChat ? 'h-[500px] opacity-100 translate-y-0' : 'h-12 opacity-90 translate-y-2'}`}>
-        <div 
-          onClick={() => !showChat && setShowChat(true)}
-          className={`flex items-center justify-between px-5 bg-gradient-to-r from-emerald-600 to-teal-700 text-white rounded-t-2xl shadow-2xl cursor-pointer ${!showChat ? 'rounded-b-2xl h-12' : 'h-14'}`}
-        >
-          <div className="flex items-center gap-3">
-            <Icon name="send" size={18}/>
-            <span className="text-sm font-bold">全栈架构师随诊</span>
-          </div>
-          {showChat && (
-            <button onClick={(e) => { e.stopPropagation(); setShowChat(false); }} className="hover:rotate-90 transition-transform">
-              <Icon name="refresh" size={16}/>
-            </button>
-          )}
-        </div>
-        
-        {showChat && (
-          <div className="flex-1 bg-slate-900 border-x border-b border-slate-800 flex flex-col overflow-hidden rounded-b-2xl shadow-2xl shadow-black/50">
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {chatMessages.length === 0 && (
-                <div className="text-center mt-10">
-                  <p className="text-[11px] text-slate-500 px-6 italic">“你可以追问关于并发模型、事务传播行为或 Vue 3 自定义 Hooks 的具体实现细节。”</p>
-                </div>
-              )}
-              {chatMessages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-xs leading-relaxed ${msg.role === 'user' ? 'bg-emerald-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-300 rounded-bl-none border border-slate-700'}`}>
-                    {msg.content}
-                  </div>
-                </div>
-              ))}
-              <div ref={chatEndRef}/>
-            </div>
-            <form onSubmit={handleChat} className="p-3 bg-slate-950/50 border-t border-slate-800 flex gap-2">
-              <input 
-                value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
-                placeholder="在此输入您的疑问..."
-                className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-emerald-500/50"
-              />
-              <button disabled={isChatting || !chatInput.trim()} className="p-2 bg-emerald-600 text-white rounded-xl hover:bg-emerald-500 transition-colors disabled:opacity-50">
-                <Icon name="send" size={16}/>
-              </button>
-            </form>
-          </div>
-        )}
-      </div>
-
       {error && (
-        <div className="fixed top-20 right-6 bg-red-500 text-white px-6 py-3 rounded-xl shadow-2xl z-[200] animate-in slide-in-from-right">
-          <div className="flex items-center gap-3">
-            <Icon name="alert" size={18}/>
-            <span className="text-sm font-bold">{error}</span>
+        <div className="fixed top-24 right-10 bg-red-600/90 backdrop-blur-xl text-white px-8 py-5 rounded-[24px] shadow-2xl z-[200] border border-red-500/50 animate-in slide-in-from-right duration-500 flex items-center gap-6">
+          <div className="p-2 bg-white/10 rounded-xl">
+            <Icon name="alert" size={24}/>
           </div>
+          <div className="flex flex-col">
+            <span className="text-[10px] font-black uppercase opacity-60">System Error</span>
+            <span className="text-[13px] font-bold">{error}</span>
+          </div>
+          <button onClick={() => setError(null)} className="ml-4 p-2 hover:bg-white/10 rounded-full transition-colors">
+            <Icon name="refresh" size={16} className="rotate-45"/>
+          </button>
         </div>
       )}
     </div>
